@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan
+import math
+
+class KrishiNavigator(Node):
+    def __init__(self):
+        super().__init__('krishi_navigator')
+
+        # Publisher for movement
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+
+        # Subscriber for LiDAR
+        self.laser_sub = self.create_subscription(
+            LaserScan, '/scan', self.laser_callback, 10)
+
+        self.timer = self.create_timer(0.1, self.control_loop)
+
+        self.regions = {'front': 0.0, 'left': 0.0, 'right': 0.0}
+        self.state = "move_forward"
+
+    def laser_callback(self, msg):
+        # Divide LiDAR readings into simple zones
+        ranges = msg.ranges
+        self.regions = {
+            'right': min(min(ranges[0:143]), 10),
+            'front': min(min(ranges[288:431]), 10),
+            'left':  min(min(ranges[576:719]), 10),
+        }
+
+    def control_loop(self):
+        msg = Twist()
+
+        # Simple obstacle avoidance logic
+        if self.regions['front'] < 0.5:
+            self.get_logger().info("Obstacle detected ahead! Turning...")
+            msg.angular.z = 0.3
+            msg.linear.x = 0.0
+        else:
+            msg.linear.x = 0.2
+            msg.angular.z = 0.0
+
+        self.cmd_pub.publish(msg)
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = KrishiNavigator()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
