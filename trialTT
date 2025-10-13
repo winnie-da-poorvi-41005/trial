@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry
+from tf_transformations import euler_from_quaternion
+import math
+import time
+
+class EbotNavigator(Node):
+    def __init__(self):
+        super().__init__('ebot_navigator')
+
+        # Publishers / Subscribers
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.lidar_sub = self.create_subscription(LaserScan, '/scan', self.lidar_callback, 10)
+        self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+
+        # Waypoints [x, y, yaw]
+        self.waypoints = [
+            [-1.53, -1.95, 1.57],
+            [-1.64,  0.99, None],
+            [0.13,   1.24,  0.00],
+            [0.38,  -3.32, -1.57]
+        ]
+
+        # Tolerances & control params
+        self.POSITION_TOLERANCE = 0.3
+        self.ORIENTATION_TOLERANCE = 10.0  # degrees
+        self.KP_LINEAR = 0.8
+        self.KP_ANGULAR = 1.2
+        self.MAX_LINEAR_VEL = 0.5
+        self.MAX_ANGULAR_VEL = 1.0
+        self.MIN_DISTANCE = 0.6  # safe distance to obstacles
+
+        # Avoidance parameters
+        self.AVOID_TURN_ANGLE = math.pi / 2.0       # turn right ~90 degrees
+        self.AVOID_FORWARD_DISTANCE = 0.7          # forward distance while avoiding
+        self.AVOID_ROT_SPEED = 0.6
+        self.AVOID_FORWARD_SPEED = 0.25
+
+        # Robot state
+        self.current_x = 0.0
+        self.current_y = 0.0
+        self.current_yaw = 0.0
+        self.current_waypoint = 0
+        self.lidar_ranges = []
+        self.lidar_angle_min = 0.0
+        self.lidar_angle_inc = 0.0
+
+        # Obstacle flags
+        self.front_blocked = False
+        self.right_blocked = False
+
+        # State machine: "ROTATING", "MOVING", "AVOID_ROTATE_RIGHT", "AVOID_FORWARD", "AVOID_ROTATE_BACK", "DONE"
+        self.state = "ROTATING"
+
+        # For avoidance bookkeeping
+        self.avoid_start_x = None
+        self.avoid_start_y = None
+        self.avoid_target_yaw = None
+        self.avoid_return_yaw = None
+
+        # Main loop
+        self.timer = self.create_timer(0.1, self.navigation_loop)
+
+        self.get_logger().info("Ebot Navigator initialized")
+        self.get_logger().info(f"Waypoints loaded: {len(self.waypoints)}")
+
+    # ------------------ Callbacks ------------------
+    def lidar_callback(self, msg: LaserScan):
+        # store for processing
+        self.lidar_ranges = list(msg.ranges)
+        self.lidar_angle_min = msg.angle_min
+        self.lidar_angle_inc = msg.angle_increment
+
+        # compute sectors robustly using angles
+        n = len(self.lidar_ranges)
+        if n == 0:
+            return
+
+        # helper to get min in angle window (radians)
+        def min_in_window(center_deg, width_deg):
+            center = math.radians(center_deg)
+            half = math.radians(width_deg / 2.0)
+            min_val = float('inf')
+            for i, r in enumerate(self.lidar_ranges):
+                angle = self.lidar_angle_min + i * self.lidar_angle_inc
+                # normalize angle to [-pi, pi]
+                a = (angle + math.pi) % (2 * math.pi) - math.pi
+                # compute angular difference
+                diff = abs(self.normalize_angle(a - center))
+                if diff <= half:
+                    if r is None or math.isinf(r) or math.isnan(r):
+                        continue
+                    min_val = min(min_val, r)
+            return min_val if min_val != float('inf') else 10.0
+
+        # Front ±30°, Right sector centered at -90° (i.e. 270°) width 60°
+        front_min = min_in_window(0, 30)
+        right_min = min_in_window(-90, 60)
+
+        self.front_blocked = front_min < self.MIN_DISTANCE
+        self.right_blocked = right_min < self.MIN_DISTANCE
+
+    def odom_callback(self, msg: Odometry):
+        self.current_x = msg.pose.pose.position.x
+        self.current_y = msg.pose.pose.position.y
+        orientation = msg.pose.pose.orientation
+        _, _, yaw = euler_from_quaternion([orientation.x, orientation.y, orientation.z, orientation.w])
+        self.current_yaw = yaw
+
+    # ------------------ Helpers ------------------
+    def calculate_distance(self, x1, y1, x2, y2):
+        return math.hypot(x2 - x1, y2 - y1)
+
+    def normalize_angle(self, angle):
+        while angle > math.pi:
+            angle -= 2 * math.pi
+        while angle < -math.pi:
+            angle += 2 * math.pi
+        return angle
+
+    def check_waypoint_reached(self):
+        if self.current_waypoint >= len(self.waypoints):
+            return True
+
+        tx, ty, tyaw = self.waypoints[self.current_waypoint]
+        distance = self.calculate_distance(self.current_x, self.current_y, tx, ty)
+
+        if tyaw is None:
+            tyaw_val = 0.0
+        else:
+            tyaw_val = tyaw
+
+        angle_diff = abs(self.normalize_angle(self.current_yaw - tyaw_val))
+        angle_diff_deg = math.degrees(angle_diff)
+
+        position_ok = distance <= self.POSITION_TOLERANCE
+        orientation_ok = angle_diff_deg <= self.ORIENTATION_TOLERANCE
+
+        # For waypoints that specify None yaw, only check position
+        if self.waypoints[self.current_waypoint][2] is None:
+            return position_ok
+        else:
+            return position_ok and orientation_ok
+
+    def stop_robot(self):
+        cmd = Twist()
+        cmd.linear.x = 0.0
+        cmd.angular.z = 0.0
+        self.cmd_vel_pub.publish(cmd)
+
+    # ------------------ Main navigation loop ------------------
+    def navigation_loop(self):
+        # If finished all waypoints -> stop
+        if self.current_waypoint >= len(self.waypoints):
+            if self.state != "DONE":
+                self.stop_robot()
+                self.state = "DONE"
+                self.get_logger().info("All waypoints reached: stopping.")
+            return
+
+        # If waypoint reached, increment and reset to ROTATING to aim at next one
+        if self.check_waypoint_reached():
+            self.current_waypoint += 1
+            if self.current_waypoint >= len(self.waypoints):
+                self.stop_robot()
+                self.get_logger().info("Reached final waypoint.")
+                return
+            self.state = "ROTATING"
+            self.get_logger().info(f"Reached waypoint -> moving to waypoint {self.current_waypoint}")
+            return
+
+        target_x, target_y, target_yaw = self.waypoints[self.current_waypoint]
+
+        # If currently in avoidance routine, handle avoidance flow
+        if self.state.startswith("AVOID"):
+            self.handle_avoidance()
+            return
+
+        # Standard navigation: If front blocked -> start avoidance (only to right)
+        if self.front_blocked:
+            if not self.right_blocked:
+                # Start avoidance to the right
+                self.get_logger().warn("Front blocked -> starting right-only avoidance")
+                # compute target yaw: turn right by ~90 degrees
+                self.avoid_target_yaw = self.normalize_angle(self.current_yaw - self.AVOID_TURN_ANGLE)
+                # yaw to return to after avoidance: face waypoint
+                angle_to_target = math.atan2(target_y - self.current_y, target_x - self.current_x)
+                self.avoid_return_yaw = angle_to_target
+                # record pos to move forward later
+                self.avoid_start_x = self.current_x
+                self.avoid_start_y = self.current_y
+                self.state = "AVOID_ROTATE_RIGHT"
+                self.handle_avoidance()
+                return
+            else:
+                # Right also blocked -> stop and wait (no left turns per user's constraint)
+                self.get_logger().error("Front and Right blocked -> cannot avoid (left not allowed). Stopping.")
+                self.stop_robot()
+                return
+
+        # NORMAL navigation (ROTATE -> MOVE)
+        angle_to_target = math.atan2(target_y - self.current_y, target_x - self.current_x)
+        angle_error = self.normalize_angle(angle_to_target - self.current_yaw)
+        distance_error = self.calculate_distance(self.current_x, self.current_y, target_x, target_y)
+
+        cmd = Twist()
+
+        if self.state == "ROTATING":
+            # rotate to face waypoint
+            if abs(angle_error) > 0.1:
+                cmd.angular.z = max(-self.MAX_ANGULAR_VEL, min(self.MAX_ANGULAR_VEL, self.KP_ANGULAR * angle_error))
+                cmd.linear.x = 0.0
+            else:
+                self.state = "MOVING"
+        elif self.state == "MOVING":
+            # move forward towards waypoint
+            if distance_error > self.POSITION_TOLERANCE:
+                # simple proportional controller
+                v = min(self.KP_LINEAR * distance_error, self.MAX_LINEAR_VEL)
+                w = self.KP_ANGULAR * angle_error * 0.5
+                # if an obstacle suddenly appears in front, stop linear and enter avoidance next tick
+                if self.front_blocked:
+                    v = 0.0
+                cmd.linear.x = v
+                cmd.angular.z = max(-self.MAX_ANGULAR_VEL, min(self.MAX_ANGULAR_VEL, w))
+            else:
+                self.state = "ROTATING"
+
+        # Safety limits and publish
+        cmd.linear.x = max(-self.MAX_LINEAR_VEL, min(self.MAX_LINEAR_VEL, cmd.linear.x))
+        cmd.angular.z = max(-self.MAX_ANGULAR_VEL, min(self.MAX_ANGULAR_VEL, cmd.angular.z))
+        self.cmd_vel_pub.publish(cmd)
+
+    # ------------------ Avoidance handlers ------------------
+    def handle_avoidance(self):
+        cmd = Twist()
+
+        if self.state == "AVOID_ROTATE_RIGHT":
+            # rotate right until we face avoid_target_yaw
+            angle_error = self.normalize_angle(self.avoid_target_yaw - self.current_yaw)
+            # since we turned right, desired angle error will be negative; rotate using negative angular speed
+            if abs(angle_error) > 0.08:
+                # choose sign so it rotates right
+                cmd.angular.z = -abs(self.AVOID_ROT_SPEED) if angle_error < 0 else -abs(self.AVOID_ROT_SPEED)
+                cmd.linear.x = 0.0
+                self.cmd_vel_pub.publish(cmd)
+                return
+            else:
+                # finished right rotation -> move forward
+                self.state = "AVOID_FORWARD"
+                # record starting point for forward travel
+                self.avoid_start_x = self.current_x
+                self.avoid_start_y = self.current_y
+                self.get_logger().info("Rotated right for avoidance -> moving forward to bypass obstacle")
+                return
+
+        elif self.state == "AVOID_FORWARD":
+            # move forward fixed distance (AVOID_FORWARD_DISTANCE)
+            dist_moved = self.calculate_distance(self.avoid_start_x, self.avoid_start_y, self.current_x, self.current_y)
+            if dist_moved < self.AVOID_FORWARD_DISTANCE and not self.front_blocked:
+                cmd.linear.x = self.AVOID_FORWARD_SPEED
+                cmd.angular.z = 0.0
+                self.cmd_vel_pub.publish(cmd)
+                return
+            else:
+                # reached avoidance forward distance or obstacle ahead; rotate back toward waypoint direction
+                angle_to_target = self.avoid_return_yaw
+                # set avoid_target_yaw to angle_to_target for rotation back
+                self.avoid_target_yaw = angle_to_target
+                self.state = "AVOID_ROTATE_BACK"
+                self.get_logger().info("Avoidance forward complete -> rotating back to target yaw")
+                return
+
+        elif self.state == "AVOID_ROTATE_BACK":
+            # rotate (shortest) to face the waypoint direction (avoid_return_yaw)
+            angle_error = self.normalize_angle(self.avoid_target_yaw - self.current_yaw)
+            if abs(angle_error) > 0.08:
+                cmd.angular.z = max(-self.MAX_ANGULAR_VEL,
+                                    min(self.MAX_ANGULAR_VEL, self.KP_ANGULAR * angle_error))
+                cmd.linear.x = 0.0
+                self.cmd_vel_pub.publish(cmd)
+                return
+            else:
+                # finished avoidance -> resume normal navigation (ROTATING to re-align precisely)
+                self.state = "ROTATING"
+                self.get_logger().info("Avoidance complete -> resuming navigation to waypoint")
+                return
+
+        else:
+            # unknown avoidance state -> stop for safety
+            self.get_logger().warn(f"Unknown avoidance state '{self.state}', stopping.")
+            self.stop_robot()
+            return
+
+def main(args=None):
+    rclpy.init(args=args)
+    navigator = EbotNavigator()
+    try:
+        rclpy.spin(navigator)
+    except KeyboardInterrupt:
+        navigator.get_logger().info("Navigation interrupted by user")
+    finally:
+        navigator.stop_robot()
+        navigator.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
